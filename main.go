@@ -5,5 +5,6 @@ import (
 )
 
 func main() {
-	monitor.ChromiumMonitor()
+	db := monitor.InitializeDB()
+	monitor.ChromiumMonitor(db)
 }

@@ -1,10 +1,10 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,26 +23,8 @@ type HTTPCall struct {
 	URL      string
 	Method   string
 	Status   int64
-	ReqBody  string
-	RespBody string
-}
-
-func NewRollingStore(limit int) *RollingStore {
-	return &RollingStore{
-		limit:   limit,
-		history: make([]*HTTPCall, 0, limit),
-	}
-}
-
-func (s *RollingStore) Add(call *HTTPCall) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.history = append(s.history, call)
-
-	if len(s.history) > s.limit {
-		s.history = s.history[1:]
-	}
+	ReqBody  []byte
+	RespBody []byte
 }
 
 func truncate(s string, max int) string {
@@ -65,18 +47,16 @@ func formatBytes(bytes uint64) string {
 	return fmt.Sprintf("%.2f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-func ChromiumMonitor() {
-	fmt.Println("Starting Unified CDP Browser Monitor (Network + Performance)...")
+func ChromiumMonitor(db *DBStore) {
+	fmt.Println("Starting Unified CDP Browser Monitor (SQLite Enabled)...")
+	fmt.Println("Press Ctrl+C to stop.")
 
-	// Connect to Chrome on port 9222, create connection context
 	allocatorCtx, cancel := chromedp.NewRemoteAllocator(context.Background(), "ws://127.0.0.1:9222/")
 	defer cancel()
 
-	// Isolate the context of the connection and commands to this tab
 	ctx, cancel := chromedp.NewContext(allocatorCtx)
 	defer cancel()
 
-	completedRequests := NewRollingStore(100)
 	var tracker sync.Map
 
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
@@ -89,62 +69,95 @@ func ChromiumMonitor() {
 			}
 
 			if e.Request.HasPostData {
-				var bodyBuilder strings.Builder
+				var bodyBuilder bytes.Buffer
 				for _, entry := range e.Request.PostDataEntries {
 					bodyBuilder.WriteString(entry.Bytes)
 				}
-				call.ReqBody = bodyBuilder.String()
+				call.ReqBody = bodyBuilder.Bytes()
 			}
 
 			tracker.Store(e.RequestID, call)
-
 			fmt.Printf("\033[36m[NET OUT]\033[0m %-4s %s\n", call.Method, truncate(call.URL, 80))
 
 		case *network.EventResponseReceived:
 			if val, ok := tracker.Load(e.RequestID); ok {
-				call := val.(*HTTPCall)
-				call.Status = e.Response.Status
-				tracker.Store(e.RequestID, call)
+				if call, isHTTP := val.(*HTTPCall); isHTTP {
+					call.Status = e.Response.Status
+					tracker.Store(e.RequestID, call)
+				}
 			}
 
 		case *network.EventLoadingFinished:
 			if val, ok := tracker.Load(e.RequestID); ok {
-				call := val.(*HTTPCall)
+				if call, isHTTP := val.(*HTTPCall); isHTTP {
+					go func(reqID network.RequestID, completedCall *HTTPCall) {
+						var bodyBytes []byte
+						err := chromedp.Run(ctx, chromedp.ActionFunc(func(c context.Context) error {
+							var err error
+							bodyBytes, err = network.GetResponseBody(reqID).Do(c)
+							return err
+						}))
 
-				// fetch body asynchronously so CDP listener isn't blocked
-				go func(reqID network.RequestID, completedCall *HTTPCall) {
-					var bodyBytes []byte
-					err := chromedp.Run(ctx, chromedp.ActionFunc(func(c context.Context) error {
-						var err error
-						bodyBytes, err = network.GetResponseBody(reqID).Do(c)
-						return err
-					}))
+						if err == nil {
+							completedCall.RespBody = bodyBytes
+						} else {
+							completedCall.RespBody = []byte(fmt.Sprintf("[Error fetching body: %v]", err))
+						}
 
-					if err == nil {
-						completedCall.RespBody = string(bodyBytes)
-					} else {
-						completedCall.RespBody = fmt.Sprintf("[Error fetching body: %v]", err)
-					}
+						db.Add(completedCall)
+						tracker.Delete(reqID)
 
-					completedRequests.Add(completedCall)
-					tracker.Delete(reqID)
-
-					fmt.Printf("\033[32m[NET IN ]\033[0m %-4s %s (Status: %d)\n", completedCall.Method, truncate(completedCall.URL, 80), completedCall.Status)
-				}(e.RequestID, call)
+						fmt.Printf("\033[32m[NET IN ]\033[0m %-4s %s (Status: %d)\n", completedCall.Method, truncate(completedCall.URL, 80), completedCall.Status)
+					}(e.RequestID, call)
+				}
 			}
 
 		case *network.EventWebSocketCreated:
+			tracker.Store(e.RequestID, e.URL)
 			fmt.Printf("\033[33m[WS CREATED]\033[0m URL: %s\n", e.URL)
+
 		case *network.EventWebSocketFrameSent:
+			url := "unknown-ws-url"
+			if val, ok := tracker.Load(e.RequestID); ok {
+				if u, isStr := val.(string); isStr {
+					url = u
+				}
+			}
+
+			call := &HTTPCall{
+				URL:     url,
+				Method:  "WS_OUT",
+				Status:  101, //standard HTTP code for WS
+				ReqBody: []byte(e.Response.PayloadData),
+			}
+			db.Add(call)
+
 			fmt.Printf("\033[33m[WS OUT]\033[0m %s\n", truncate(e.Response.PayloadData, 80))
+
 		case *network.EventWebSocketFrameReceived:
+			url := "unknown-ws-url"
+			if val, ok := tracker.Load(e.RequestID); ok {
+				if u, isStr := val.(string); isStr {
+					url = u
+				}
+			}
+
+			call := &HTTPCall{
+				URL:      url,
+				Method:   "WS_IN",
+				Status:   101,
+				RespBody: []byte(e.Response.PayloadData),
+			}
+			db.Add(call)
+
 			fmt.Printf("\033[33m[WS IN]\033[0m %s\n", truncate(e.Response.PayloadData, 80))
+
 		case *network.EventWebSocketClosed:
+			tracker.Delete(e.RequestID)
 			fmt.Printf("\033[33m[WS CLOSED]\033[0m\n")
 		}
 	})
 
-	// explicitly enable network domain monitoring on attachment
 	err := chromedp.Run(ctx, network.Enable())
 	if err != nil {
 		log.Fatalf("Failed to attach and enable network on browser: %v", err)
@@ -159,7 +172,6 @@ func ChromiumMonitor() {
 		err := chromedp.Run(ctx, chromedp.ActionFunc(func(c context.Context) error {
 			var err error
 			_ = performance.Enable().Do(c)
-
 			metrics, err = performance.GetMetrics().Do(c)
 			return err
 		}))
@@ -169,30 +181,13 @@ func ChromiumMonitor() {
 			continue
 		}
 
-		var heapUsed, domNodes, layoutCount, layoutDuration, recalcStyleCount, recalcDuration float64
-
+		var heapUsed float64
 		for _, m := range metrics {
-			switch m.Name {
-			case "JSHeapUsedSize":
+			if m.Name == "JSHeapUsedSize" {
 				heapUsed = m.Value
-			case "Nodes":
-				domNodes = m.Value
-			case "LayoutCount":
-				layoutCount = m.Value
-			case "LayoutDuration":
-				layoutDuration = m.Value
-			case "RecalcStyleCount":
-				recalcStyleCount = m.Value
-			case "RecalcStyleDuration":
-				recalcDuration = m.Value
 			}
 		}
 
-		fmt.Printf("\033[35m[SYS]\033[0m Heap: %-8s | DOM: %-5.0f | Layouts: %.0f (%.1fms) | Style Recalcs: %.0f (%.1fms)\n",
-			formatBytes(uint64(heapUsed)),
-			domNodes,
-			layoutCount, layoutDuration*1000,
-			recalcStyleCount, recalcDuration*1000,
-		)
+		fmt.Printf("\033[35m[SYS]\033[0m Heap: %-8s\n", formatBytes(uint64(heapUsed)))
 	}
 }
